@@ -44,8 +44,6 @@ The project relies on several key packages, including but not limited to:
 
 ## Getting Started
 
-## Getting Started
-
 To get started with the project, follow these steps:
 
 1. Clone the repository:
@@ -57,13 +55,17 @@ To get started with the project, follow these steps:
     ```sh
     cd tut-aiagents
     ```
-
-3. Create a `.env` file in the project root with the following content:
-    ```
-    AZURE_OPENAI_MODEL_ID=<your-model-id>
-    AZURE_OPENAI_ENDPOINT=<your-endpoint>
-    AZURE_OPENAI_API_KEY=<your-api-key>
-    ```
+   
+3. Set the apikey via user-secrets
+   ```
+   cd tut-aiagents
+   dotnet user-secrets init
+   dotnet user-secrets set "AZURE_OPENAI_API_KEY" "<your-api-key>"
+   dotnet user-secrets set "AZURE_OPENAI_MODEL_ID" "<your-model-id>"
+   dotnet user-secrets set "AZURE_OPENAI_ENDPOINT" "<your-endpoint>"
+   ```
+   Alternatively you could also create a appsettings.json and set the values there. Ensure that the appsettings.json is 
+   copied to the build output if you decide to take this route. Do not commit your apikey to source control.
 
 4. Restore dependencies:
     ```sh
