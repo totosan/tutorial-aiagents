@@ -6,18 +6,23 @@
     <RootNamespace>tut_aiagents</RootNamespace>
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
+    <UserSecretsId>e493cf79-5988-4aca-8ace-229b69d5a92b</UserSecretsId>
   </PropertyGroup>
   <PropertyGroup>
     <NoWarn>$(NoWarn);CA2007;IDE1006;SKEXP0001;SKEXP0110;OPENAI001</NoWarn>
   </PropertyGroup>
   <ItemGroup>
-    <PackageReference Include="DotNetEnv" Version="3.1.1" />
-    <PackageReference Include="Microsoft.Extensions.Logging.Console" Version="9.0.1" />
+    <PackageReference Include="Microsoft.Extensions.Hosting" Version="9.0.2" />
     <PackageReference Include="Microsoft.SemanticKernel" Version="1.35.0" />
     <PackageReference Include="microsoft.semantickernel.agents.abstractions" Version="1.35.0-alpha" />
     <PackageReference Include="microsoft.semantickernel.agents.core" Version="1.35.0-alpha" />
     <PackageReference Include="microsoft.semantickernel.agents.openai" Version="1.35.0-alpha" />
     <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="9.0.1" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="appsettings.json">
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 
 </Project>

@@ -1,4 +1,7 @@
 ﻿using System.Text.Json;
+using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 using Microsoft.SemanticKernel;
 using Microsoft.SemanticKernel.Agents;
 using Microsoft.SemanticKernel.Agents.Chat;
@@ -7,41 +10,65 @@ using Microsoft.SemanticKernel.ChatCompletion;
 using Microsoft.SemanticKernel.Connectors.AzureOpenAI;
 using tut_aiagents.Plugins;
 using Microsoft.Extensions.Logging;
-using Microsoft.Extensions.Logging.Abstractions;
 
 #pragma warning disable SKEXP0001 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
 #pragma warning disable SKEXP0110 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
-namespace tut_aiagents
+namespace tut_aiagents;
+
+class Program
 {
-    class Program
+    static async Task Main(string[] args)
     {
-        static async Task Main(string[] args)
+        var host = Host.CreateDefaultBuilder()
+            .UseEnvironment("Development")
+            .Build();
+
+        var loggerFactory = host.Services.GetRequiredService<ILoggerFactory>();
+        var configuration = host.Services.GetRequiredService<IConfiguration>();
+
+        var builder = Kernel.CreateBuilder();
+        try
         {
+            var modelId = configuration.GetValue<string>("AZURE_OPENAI_MODEL_ID");
+            var endpoint = configuration.GetValue<string>("AZURE_OPENAI_ENDPOINT");
+            var apiKey = configuration.GetValue<string>("AZURE_OPENAI_API_KEY");
+            builder.AddAzureOpenAIChatCompletion(modelId, endpoint, apiKey);
+        }
+        catch (Exception)
+        {
+            throw new Exception("Please set the environment variables AZURE_OPENAI_MODEL_ID, AZURE_OPENAI_ENDPOINT, and AZURE_OPENAI_API_KEY");
+        }
 
-            var loggerFactory = NullLoggerFactory.Instance;
-            //var loggerFactory = LoggerFactory.Create(builder => builder.AddConsole());
-            var logger = loggerFactory.CreateLogger<Program>();
+        var kernel = builder.Build();
 
-            var nameResolver = "Resolver";
-            var nameNetworkChecker = "NetworkChecker";
-            var nameAnalyst = "Analyst";
-            var nameCommonChecker = "CommonChecker";
+        var networkKernel = kernel.Clone();
+        var pluginNetwork = KernelPluginFactory.CreateFromType<NetworkMonitor>();
+        networkKernel.Plugins.Add(pluginNetwork);
 
-            var kernel = CreateKernelWithChatCompletion();
+        var hostMetricsKernel = kernel.Clone();
+        var pluginHost = KernelPluginFactory.CreateFromType<HostMetrics>();
+        hostMetricsKernel.Plugins.Add(pluginHost);
 
-            var networkKernel = kernel.Clone();
-            var pluginNetwork = KernelPluginFactory.CreateFromType<NetworkMonitor>();
-            networkKernel.Plugins.Add(pluginNetwork);
+        // Define the agent
+        var agentAnalyst = ConfigureAgentAnalyst("Analyst", kernel, loggerFactory);
+        var agentNetworkChecker = ConfigureAgentNetworkChecker("NetworkChecker", networkKernel, loggerFactory);
+        var agentCommonChecker = ConfigureAgentCommonChecker("CommonChecker", hostMetricsKernel, loggerFactory);
+        var agentResolver = ConfigureAgentResolver("Resolver", kernel, loggerFactory);
+            
+        var selectionFct = ConfigureSelectionFunction(agentAnalyst.Name, agentNetworkChecker.Name, agentCommonChecker.Name, agentResolver.Name);
+        var terminationFct = ConfigureTerminationFunction();
 
-            var hostMetricsKernel = kernel.Clone();
-            var pluginHost = KernelPluginFactory.CreateFromType<HostMetrics>();
-            hostMetricsKernel.Plugins.Add(pluginHost);
+        var groupChat = ConfigureGroupChat(agentAnalyst, agentNetworkChecker, agentResolver, agentCommonChecker, selectionFct, kernel, terminationFct, loggerFactory);
 
-            // Define the agent
-            ChatCompletionAgent agentAnalyst = new()
-            {
-                Name = nameAnalyst,
-                Instructions =
+
+        await RunMainLoop(groupChat);
+    }
+
+    private static ChatCompletionAgent ConfigureAgentAnalyst(string nameAnalyst, Kernel kernel, ILoggerFactory loggerFactory) =>
+        new()
+        {
+            Name = nameAnalyst,
+            Instructions =
                 """
                 **Role:** You are an experienced IT professional specializing in network troubleshooting. You have extensive knowledge of network connections, security, and general IT issues.
 
@@ -78,15 +105,15 @@ namespace tut_aiagents
                 6. Summarize the analysis.
                 7. Send the analysis report to the Resolver.
                 """,
-                Kernel = kernel,
-                LoggerFactory = loggerFactory
-            };
+            Kernel = kernel,
+            LoggerFactory = loggerFactory
+        };
 
-
-            ChatCompletionAgent agentNetworkChecker = new()
-            {
-                Name = nameNetworkChecker,
-                Instructions =
+    private static ChatCompletionAgent ConfigureAgentNetworkChecker(string nameNetworkChecker, Kernel networkKernel, ILoggerFactory loggerFactory) =>
+        new()
+        {
+            Name = nameNetworkChecker,
+            Instructions =
                 """
                 **Role:** You are a Network Checker with over 10 years of experience. You specialize in diagnosing network connectivity issues.
 
@@ -125,15 +152,16 @@ namespace tut_aiagents
                 - **Adapter Information:** [Details]
                 - **DNS Configuration:** [Details]
                 """,
-                Kernel = networkKernel,
-                Arguments = new KernelArguments(new AzureOpenAIPromptExecutionSettings() { FunctionChoiceBehavior = FunctionChoiceBehavior.Auto() }),
-                LoggerFactory = loggerFactory
-            };
+            Kernel = networkKernel,
+            Arguments = new KernelArguments(new AzureOpenAIPromptExecutionSettings() { FunctionChoiceBehavior = FunctionChoiceBehavior.Auto() }),
+            LoggerFactory = loggerFactory
+        };
 
-            ChatCompletionAgent agentCommonChecker = new()
-            {
-                Name = nameCommonChecker,
-                Instructions =
+    private static ChatCompletionAgent ConfigureAgentCommonChecker(string nameCommonChecker, Kernel hostMetricsKernel, ILoggerFactory loggerFactory) =>
+        new()
+        {
+            Name = nameCommonChecker,
+            Instructions =
                 """
                 **Role:** You are an IT generalist who checks common system issues unrelated to the network, such as hardware status, software updates, and system performance.
 
@@ -148,7 +176,7 @@ namespace tut_aiagents
 
                 - Focus only on following checks
                     - CPU, Memory and Storage.
-                
+
                 **Rules:**
 
                 - Unhealthy CPU is about 80% or more.
@@ -156,7 +184,7 @@ namespace tut_aiagents
                 - Unhealthy Storage is about 80% or more.
 
                 **Communication Style:**
-                
+
                 - Start your message with "I am Common Checker".
                 - Use clear and simple language.
                 - Be concise.
@@ -168,283 +196,258 @@ namespace tut_aiagents
                 - "All hardware components are functioning correctly."
                 - "Metrics are healthy and no issues are detected."
                 """,
-                Kernel = hostMetricsKernel,
-                Arguments = new KernelArguments(new AzureOpenAIPromptExecutionSettings() { FunctionChoiceBehavior = FunctionChoiceBehavior.Auto() }),
-                LoggerFactory = loggerFactory
-            };
+            Kernel = hostMetricsKernel,
+            Arguments = new KernelArguments(new AzureOpenAIPromptExecutionSettings() { FunctionChoiceBehavior = FunctionChoiceBehavior.Auto() }),
+            LoggerFactory = loggerFactory
+        };
 
-            const string instructionResolver = """
-                    **Role:** You are the Resolver, responsible for providing solutions to the issues identified by the Analyst.
+    private static ChatCompletionAgent ConfigureAgentResolver(string nameResolver, Kernel kernel, ILoggerFactory loggerFactory)
+    {
+        const string instructionResolver = """
+                                           **Role:** You are the Resolver, responsible for providing solutions to the issues identified by the Analyst.
 
-                    **Task:** You first summarize the steps taken by the Analyst and the findings from the Network Checker and Common Checker. Then, you provide a clear and actionable solution to the problem.
+                                           **Task:** You first summarize the steps taken by the Analyst and the findings from the Network Checker and Common Checker. Then, you provide a clear and actionable solution to the problem.
 
-                    **Guidelines for two scenarios :**
-                    - first scenario:
-                        - Summarize the analysis steps and findings.
-                        - The issue is either resolved or no issue to find.
-                        - State in a seperate line **APPROVED** 
-                    - second scenario:
-                        - summarize the analysis steps and findings.
-                        - The issue is not resolved.
-                        - The analysis steps are not enough.
-                        - State in a seperate line **REJECTED**
-                    
-                    **Communication style:**
-                    - Start your message with "I am Resolver"
-                    - Keep your answer alwyas short and simple.
-                    - Be professional and clear.
+                                           **Guidelines for two scenarios :**
+                                           - first scenario:
+                                               - Summarize the analysis steps and findings.
+                                               - The issue is either resolved or no issue to find.
+                                               - State in a seperate line **APPROVED** 
+                                           - second scenario:
+                                               - summarize the analysis steps and findings.
+                                               - The issue is not resolved.
+                                               - The analysis steps are not enough.
+                                               - State in a seperate line **REJECTED**
 
-                    respond in JSON format with the following structure:
-                    ```
-                    {
-                        "approved": true,
-                        "solution": "Your solution here"
-                    }
-                    ```
-                    """;
-            const string instructionResolverJson = 
-                    """
-                    ***Role:*** You are the Resolver, responsible for providing solutions to the issues identified by the Analyst.
+                                           **Communication style:**
+                                           - Start your message with "I am Resolver"
+                                           - Keep your answer alwyas short and simple.
+                                           - Be professional and clear.
 
-                    Respond in JSON format with the following structure:
-                    ```
-                    {
-                        "approved": true,
-                        "solution": "Your solution here"
-                    }
-                    ```
-                    """;
-            ChatCompletionAgent agentResolver = new()
+                                           respond in JSON format with the following structure:
+                                           ```
+                                           {
+                                               "approved": true,
+                                               "solution": "Your solution here"
+                                           }
+                                           ```
+                                           """;
+        const string instructionResolverJson = 
+            """
+            ***Role:*** You are the Resolver, responsible for providing solutions to the issues identified by the Analyst.
+
+            Respond in JSON format with the following structure:
+            ```
             {
-                Name = nameResolver,
-                Instructions =
-                    instructionResolver,
-                Kernel = kernel,
-                LoggerFactory = loggerFactory
-            };
+                "approved": true,
+                "solution": "Your solution here"
+            }
+            ```
+            """;
+        ChatCompletionAgent agentResolver = new()
+        {
+            Name = nameResolver,
+            Instructions = instructionResolver,
+            Kernel = kernel,
+            LoggerFactory = loggerFactory
+        };
+        return agentResolver;
+    }
 
+    private static KernelFunction ConfigureSelectionFunction(string? nameAnalyst, string? nameNetworkChecker,
+        string? nameCommonChecker, string? nameResolver) =>
+        AgentGroupChat.CreatePromptFunctionForStrategy(
+            $$$"""
+               **Task:** Determine which agent should act next based on the last response. Respond with **only** the agent's name from the list below. Do not add any explanations or extra text.
 
-            // --------------------------------------------------------------------------------------------
-            // Selection function
-            // --------------------------------------------------------------------------------------------
-            KernelFunction selectionFct = AgentGroupChat.CreatePromptFunctionForStrategy(
-                $$$"""
-                **Task:** Determine which agent should act next based on the last response. Respond with **only** the agent's name from the list below. Do not add any explanations or extra text.
+               **Agents:**
 
-                **Agents:**
+               - {{{nameAnalyst}}} 
+               - {{{nameNetworkChecker}}}
+               - {{{nameCommonChecker}}}
+               - {{{nameResolver}}}
 
-                - {{{nameAnalyst}}} 
-                - {{{nameNetworkChecker}}}
-                - {{{nameCommonChecker}}}
-                - {{{nameResolver}}}
+               **Selection Rules:**
 
-                **Selection Rules:**
+               - **If the last response is from the user:** Choose **{{{nameAnalyst}}} **.
+               - **If the last response is from {{{nameAnalyst}}}  and they are requesting network details:** Choose **{{{nameNetworkChecker}}}**.
+               - **If the last response is from {{{nameAnalyst}}}  and they are requesting system checks:** Choose **{{{nameCommonChecker}}}**.
+               - **If the last response is from {{{nameAnalyst}}}  and they have provided an analysis report:** Choose **{{{nameResolver}}}**.
+               - **If the last response is from {{{nameNetworkChecker}}} or {{{nameCommonChecker}}}:** Choose **{{{{nameAnalyst}}} }**.
+               - **Never select the same agent who provided the last response.**
 
-                - **If the last response is from the user:** Choose **{{{nameAnalyst}}} **.
-                - **If the last response is from {{{nameAnalyst}}}  and they are requesting network details:** Choose **{{{nameNetworkChecker}}}**.
-                - **If the last response is from {{{nameAnalyst}}}  and they are requesting system checks:** Choose **{{{nameCommonChecker}}}**.
-                - **If the last response is from {{{nameAnalyst}}}  and they have provided an analysis report:** Choose **{{{nameResolver}}}**.
-                - **If the last response is from {{{nameNetworkChecker}}} or {{{nameCommonChecker}}}:** Choose **{{{{nameAnalyst}}} }**.
-                - **Never select the same agent who provided the last response.**
+               **Last Response:**
 
-                **Last Response:**
+               {{$lastmessage}}
+               """,
+            safeParameterNames: "lastmessage"
+        );
 
-                {{$lastmessage}}
-                """,
-                safeParameterNames: "lastmessage"
-            );
+    private static KernelFunction ConfigureTerminationFunction() =>
+        AgentGroupChat.CreatePromptFunctionForStrategy(
+            $$$"""
+               **Task:** Determine, if the 'Resolver' approved or rejected.
 
-            // --------------------------------------------------------------------------------------------
-            // Termination function
-            // --------------------------------------------------------------------------------------------
-            KernelFunction terminationFct = AgentGroupChat.CreatePromptFunctionForStrategy(
-                $$$"""
-                **Task:** Determine, if the 'Resolver' approved or rejected.
+               **Rules:**
+               - you can end this conversation, if 'Resolver' approved.
+               - you can only approve, if last message was from 'Resolver'.
+               - **If the Resolver has approved:** Respond with **YES**.
+               - **If there are still unresolved issues or action is required:** Respond with **NO**.
 
-                **Rules:**
-                - you can end this conversation, if 'Resolver' approved.
-                - you can only approve, if last message was from 'Resolver'.
-                - **If the Resolver has approved:** Respond with **YES**.
-                - **If there are still unresolved issues or action is required:** Respond with **NO**.
+               **Communication**:
+               Provide a simple and short eplanation about your decission.
+               Provide a last single line with only **YES** or **NO**. Do not add any additional text to that line.
 
-                **Communication**:
-                Provide a simple and short eplanation about your decission.
-                Provide a last single line with only **YES** or **NO**. Do not add any additional text to that line.
+               **Last Response:**
 
-                **Last Response:**
+               {{$lastmessage}}
+               """,
+            safeParameterNames: "lastmessage"
+        );
 
-                {{$lastmessage}}
-                """,
-                safeParameterNames: "lastmessage"
-            );
-
-
-            AgentGroupChat groupChat = new(agentAnalyst, agentNetworkChecker, agentResolver, agentCommonChecker)
+    private static AgentGroupChat ConfigureGroupChat(ChatCompletionAgent agentAnalyst,
+        ChatCompletionAgent agentNetworkChecker, ChatCompletionAgent agentResolver, ChatCompletionAgent agentCommonChecker,
+        KernelFunction selectionFct, Kernel kernel, KernelFunction terminationFct, ILoggerFactory loggerFactory)
+    {
+        AgentGroupChat groupChat = new(agentAnalyst, agentNetworkChecker, agentResolver, agentCommonChecker)
+        {
+            ExecutionSettings = new()
             {
-                ExecutionSettings = new()
+                SelectionStrategy = new KernelFunctionSelectionStrategy(selectionFct, kernel)
                 {
-                    SelectionStrategy = new KernelFunctionSelectionStrategy(selectionFct, kernel)
+                    InitialAgent = agentAnalyst,
+                    HistoryReducer = new ChatHistoryTruncationReducer(1),
+                    HistoryVariableName = "lastmessage",
+                    ResultParser = (result) =>
                     {
-                        InitialAgent = agentAnalyst,
-                        HistoryReducer = new ChatHistoryTruncationReducer(1),
-                        HistoryVariableName = "lastmessage",
-                        ResultParser = (result) =>
-                        {
-                            var selection = result.GetValue<string>() ?? agentAnalyst.Name;
-                            Console.WriteLine($"Next agent: {selection}");
-                            return selection;
-                        }
-                    },
-                    TerminationStrategy = new KernelFunctionTerminationStrategy(terminationFct, kernel)
-                    {
-                        //Agents = new[] { agentAnalyst, agentNetworkChecker, agentResolver, agentCommonChecker },
-                        Agents = new[] {  agentResolver },
-                        HistoryVariableName = "lastmessage",
-                        HistoryReducer = new ChatHistoryTruncationReducer(1),
-                        MaximumIterations = 10,
-                        ResultParser = (recall) => {
-                            var result =recall.GetValue<string>();
-                            var yes = result?.ToLower().Contains("yes");
-                            if((bool)yes) 
-                            {
-                                Console.WriteLine($"Termination: {result}");
-                            }
-                            return yes ?? false;}
-                            
+                        var selection = result.GetValue<string>() ?? agentAnalyst.Name;
+                        Console.WriteLine($"Next agent: {selection}");
+                        return selection;
                     }
                 },
-                LoggerFactory = loggerFactory,
-            };
-
-
-            bool isComplete = false;
-            do
-            {
-                Console.WriteLine();
-                Console.Write("User > ");
-                string input = Console.ReadLine();
-                if (string.IsNullOrWhiteSpace(input))
+                TerminationStrategy = new KernelFunctionTerminationStrategy(terminationFct, kernel)
                 {
-                    continue;
-                }
-                input = input.Trim();
-                if (input.Equals("EXIT", StringComparison.OrdinalIgnoreCase))
-                {
-                    isComplete = true;
-                    break;
-                }
-
-                if (input.Equals("RESET", StringComparison.OrdinalIgnoreCase))
-                {
-                    await groupChat.ResetAsync();
-                    Console.WriteLine("[Conversation has been reset]");
-                    continue;
-                }
-
-                groupChat.AddChatMessage(new ChatMessageContent(AuthorRole.User, input));
-                groupChat.IsComplete = false;
-
-                try
-                {
-                    await foreach (ChatMessageContent response in groupChat.InvokeAsync())
-                    {
-                        Console.WriteLine();
-                        Console.WriteLine($"{response.AuthorName.ToUpperInvariant()}:{Environment.NewLine}{response.Content}");
-                    }
-                }
-                catch (HttpOperationException exception)
-                {
-                    Console.WriteLine(exception.Message);
-                    if (exception.InnerException != null)
-                    {
-                        Console.WriteLine(exception.InnerException.Message);
-                        if (exception.InnerException.Data.Count > 0)
+                    //Agents = new[] { agentAnalyst, agentNetworkChecker, agentResolver, agentCommonChecker },
+                    Agents = new[] {  agentResolver },
+                    HistoryVariableName = "lastmessage",
+                    HistoryReducer = new ChatHistoryTruncationReducer(1),
+                    MaximumIterations = 10,
+                    ResultParser = (recall) => {
+                        var result =recall.GetValue<string>();
+                        var yes = result?.ToLower().Contains("yes");
+                        if((bool)yes) 
                         {
-                            Console.WriteLine(JsonSerializer.Serialize(exception.InnerException.Data, new JsonSerializerOptions() { WriteIndented = true }));
+                            Console.WriteLine($"Termination: {result}");
                         }
-                    }
+                        return yes ?? false;}
+                            
                 }
-            } while (!isComplete);
-        }
+            },
+            LoggerFactory = loggerFactory,
+        };
+        return groupChat;
+    }
 
-
-        // --------------------------------------------------------------------------------------------
-
-        private sealed class ApprovalTerminationStrategy : TerminationStrategy
+    private static async Task RunMainLoop(AgentGroupChat groupChat)
+    {
+        while(true)
         {
-            // Terminate when the final message contains the term "approve"
-            protected override Task<bool> ShouldAgentTerminateAsync(Agent agent, IReadOnlyList<ChatMessageContent> history, CancellationToken cancellationToken)
-                => Task.FromResult(history[history.Count - 1].Content?.Contains("approve", StringComparison.OrdinalIgnoreCase) ?? false);
-        }
+            Console.WriteLine();
+            Console.Write("User > ");
+            var input = Console.ReadLine();
+            if (string.IsNullOrWhiteSpace(input))
+            {
+                continue;
+            }
+            input = input.Trim();
+            if (input.Equals("EXIT", StringComparison.OrdinalIgnoreCase))
+            {
+                break;
+            }
 
-        static Kernel CreateKernelWithChatCompletion()
-        {
-            var builder = Kernel.CreateBuilder();
+            if (input.Equals("RESET", StringComparison.OrdinalIgnoreCase))
+            {
+                await groupChat.ResetAsync();
+                Console.WriteLine("[Conversation has been reset]");
+                continue;
+            }
 
-            AddChatCompletionToKernel(builder);
+            groupChat.AddChatMessage(new ChatMessageContent(AuthorRole.User, input));
+            groupChat.IsComplete = false;
 
-            return builder.Build();
-        }
-
-        static void AddChatCompletionToKernel(IKernelBuilder builder)
-        {
             try
             {
-                var envs = DotNetEnv.Env.Load();
-                builder.AddAzureOpenAIChatCompletion(
-                    Environment.GetEnvironmentVariable("AZURE_OPENAI_MODEL_ID"),
-                    Environment.GetEnvironmentVariable("AZURE_OPENAI_ENDPOINT"),
-                    Environment.GetEnvironmentVariable("AZURE_OPENAI_API_KEY"));
-            }
-            catch (System.Exception)
-            {
-                throw new Exception("Please set the environment variables AZURE_OPENAI_MODEL_ID, AZURE_OPENAI_ENDPOINT, and AZURE_OPENAI_API_KEY");
-            }
-        }
-
-        static void WriteAgentChatMessage(ChatMessageContent message)
-        {
-            // Include ChatMessageContent.AuthorName in output, if present.
-            string authorExpression = message.Role == AuthorRole.User ? string.Empty : $" - {message.AuthorName ?? "*"}";
-            // Include TextContent (via ChatMessageContent.Content), if present.
-            string contentExpression = string.IsNullOrWhiteSpace(message.Content) ? string.Empty : message.Content;
-            bool isCode = message.Metadata?.ContainsKey(OpenAIAssistantAgent.CodeInterpreterMetadataKey) ?? false;
-            string codeMarker = isCode ? "\n  [CODE]\n" : " ";
-            Console.WriteLine($"\n# {message.Role}{authorExpression}:{codeMarker}{contentExpression}");
-
-            // Provide visibility for inner content (that isn't TextContent).
-            foreach (KernelContent item in message.Items)
-            {
-                if (item is AnnotationContent annotation)
+                await foreach (var response in groupChat.InvokeAsync())
                 {
-                    Console.WriteLine($"  [{item.GetType().Name}] {annotation.Quote}: File #{annotation.FileId}");
-                }
-                else if (item is FileReferenceContent fileReference)
-                {
-                    Console.WriteLine($"  [{item.GetType().Name}] File #{fileReference.FileId}");
-                }
-                else if (item is ImageContent image)
-                {
-                    Console.WriteLine($"  [{item.GetType().Name}] {image.Uri?.ToString() ?? image.DataUri ?? $"{image.Data?.Length} bytes"}");
-                }
-                else if (item is FunctionCallContent functionCall)
-                {
-                    Console.WriteLine($"  [{item.GetType().Name}] {functionCall.Id}");
-                }
-                else if (item is FunctionResultContent functionResult)
-                {
-                    Console.WriteLine($"  [{item.GetType().Name}] {functionResult.CallId} - {functionResult.Result?.ToString() ?? "*"}");
+                    Console.WriteLine();
+                    Console.WriteLine($"{response.AuthorName?.ToUpperInvariant()}:{Environment.NewLine}{response.Content}");
                 }
             }
-
-
-
-            void WriteUsage(long totalTokens, long inputTokens, long outputTokens)
+            catch (HttpOperationException exception)
             {
-                Console.WriteLine($"  [Usage] Tokens: {totalTokens}, Input: {inputTokens}, Output: {outputTokens}");
+                Console.WriteLine(exception.Message);
+                if (exception.InnerException != null)
+                {
+                    Console.WriteLine(exception.InnerException.Message);
+                    if (exception.InnerException.Data.Count > 0)
+                    {
+                        Console.WriteLine(JsonSerializer.Serialize(exception.InnerException.Data, new JsonSerializerOptions() { WriteIndented = true }));
+                    }
+                }
             }
         }
     }
+
+
+    private sealed class ApprovalTerminationStrategy : TerminationStrategy
+    {
+        // Terminate when the final message contains the term "approve"
+        protected override Task<bool> ShouldAgentTerminateAsync(Agent agent, IReadOnlyList<ChatMessageContent> history, CancellationToken cancellationToken)
+            => Task.FromResult(history[history.Count - 1].Content?.Contains("approve", StringComparison.OrdinalIgnoreCase) ?? false);
+    }
+
+    static void WriteAgentChatMessage(ChatMessageContent message)
+    {
+        // Include ChatMessageContent.AuthorName in output, if present.
+        string authorExpression = message.Role == AuthorRole.User ? string.Empty : $" - {message.AuthorName ?? "*"}";
+        // Include TextContent (via ChatMessageContent.Content), if present.
+        string contentExpression = string.IsNullOrWhiteSpace(message.Content) ? string.Empty : message.Content;
+        bool isCode = message.Metadata?.ContainsKey(OpenAIAssistantAgent.CodeInterpreterMetadataKey) ?? false;
+        string codeMarker = isCode ? "\n  [CODE]\n" : " ";
+        Console.WriteLine($"\n# {message.Role}{authorExpression}:{codeMarker}{contentExpression}");
+
+        // Provide visibility for inner content (that isn't TextContent).
+        foreach (KernelContent item in message.Items)
+        {
+            if (item is AnnotationContent annotation)
+            {
+                Console.WriteLine($"  [{item.GetType().Name}] {annotation.Quote}: File #{annotation.FileId}");
+            }
+            else if (item is FileReferenceContent fileReference)
+            {
+                Console.WriteLine($"  [{item.GetType().Name}] File #{fileReference.FileId}");
+            }
+            else if (item is ImageContent image)
+            {
+                Console.WriteLine($"  [{item.GetType().Name}] {image.Uri?.ToString() ?? image.DataUri ?? $"{image.Data?.Length} bytes"}");
+            }
+            else if (item is FunctionCallContent functionCall)
+            {
+                Console.WriteLine($"  [{item.GetType().Name}] {functionCall.Id}");
+            }
+            else if (item is FunctionResultContent functionResult)
+            {
+                Console.WriteLine($"  [{item.GetType().Name}] {functionResult.CallId} - {functionResult.Result?.ToString() ?? "*"}");
+            }
+        }
+
+
+
+        void WriteUsage(long totalTokens, long inputTokens, long outputTokens)
+        {
+            Console.WriteLine($"  [Usage] Tokens: {totalTokens}, Input: {inputTokens}, Output: {outputTokens}");
+        }
+    }
+}
 #pragma warning restore SKEXP0110 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
 #pragma warning restore SKEXP0001 // Type is for evaluation purposes only and is subject to change or removal in future updates. Suppress this diagnostic to proceed.
-}
